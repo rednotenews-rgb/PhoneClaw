@@ -75,6 +75,8 @@ final class MiniCPMVBackend: InferenceService {
     // MARK: Private
 
     @ObservationIgnored private let bundleResolver: (String) -> MTMDPathBundle?
+    @ObservationIgnored private let onModelLoaded: ((String) -> Void)?
+    @ObservationIgnored private let onModelUnloaded: (() -> Void)?
 
     /// MTMDWrapper 在 @MainActor 上构造, 首次 load 时懒加载。
     @ObservationIgnored private var wrapper: MTMDWrapper?
@@ -135,8 +137,14 @@ final class MiniCPMVBackend: InferenceService {
 
     // MARK: Init
 
-    init(bundleResolver: @escaping (String) -> MTMDPathBundle?) {
+    init(
+        bundleResolver: @escaping (String) -> MTMDPathBundle?,
+        onModelLoaded: ((String) -> Void)? = nil,
+        onModelUnloaded: (() -> Void)? = nil
+    ) {
         self.bundleResolver = bundleResolver
+        self.onModelLoaded = onModelLoaded
+        self.onModelUnloaded = onModelUnloaded
     }
 
     // MARK: - Lifecycle
@@ -248,6 +256,7 @@ final class MiniCPMVBackend: InferenceService {
             self.statusMessage = tr("MiniCPM-V 已就绪",
                                     "MiniCPM-V ready")
         }
+        onModelLoaded?(modelID)
     }
 
     /// 预热 vision 编码路径: 触发 CoreML merger 模型 lazy load + ANE 第一次编译。
@@ -299,6 +308,7 @@ final class MiniCPMVBackend: InferenceService {
         loadedModelID = nil
         statusMessage = tr("已卸载", "Unloaded")
         prefilledSegments = []  // KV reuse 跟踪状态归零
+        onModelUnloaded?()
 
         Task { @MainActor [weak self] in
             await self?.wrapper?.cleanup()

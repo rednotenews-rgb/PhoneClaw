@@ -1282,10 +1282,9 @@ struct ConfigurationsView: View {
         engine.applySamplingConfig()
 
         engine.config.selectedModelID = selectedModelID
-        let needsLoad = !engine.isModelReady || engine.catalog.loadedModel?.id != selectedModelID
         // backend / MTP 变更也要 reload — LiteRTLMEngine 在 load 时构造,
         // 这两个参数都不可热切换。
-        if modelChanged || backendChanged || mtpChanged || needsLoad {
+        if modelChanged || backendChanged || mtpChanged {
             engine.reloadModel()
         }
         return true
