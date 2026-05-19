@@ -457,7 +457,7 @@ struct ConfigurationsView: View {
         case .checkingSource:
             return tr("检查中", "Checking")
         case .downloading:
-            return tr("下载中", "Downloading")
+            return tr("下载完成后可启用", "Available after download")
         case .failed:
             return tr("模型下载失败", "Download failed")
         }
@@ -792,8 +792,8 @@ struct ConfigurationsView: View {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(tr(
-                        "下载中 \(completedFiles)/\(totalFiles)",
-                        "Downloading \(completedFiles)/\(totalFiles)"
+                        "文件 \(completedFiles)/\(totalFiles)",
+                        "Files \(completedFiles)/\(totalFiles)"
                     ))
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(SettingsStyle.ink)
@@ -1129,8 +1129,8 @@ struct ConfigurationsView: View {
             .frame(height: 3)
 
             Text(tr(
-                "下载中 \(completedFiles)/\(totalFiles)",
-                "Downloading \(completedFiles)/\(totalFiles)"
+                "文件 \(completedFiles)/\(totalFiles)",
+                "Files \(completedFiles)/\(totalFiles)"
             ))
             .font(.system(size: 11, weight: .regular))
             .foregroundStyle(SettingsStyle.tertiary)
