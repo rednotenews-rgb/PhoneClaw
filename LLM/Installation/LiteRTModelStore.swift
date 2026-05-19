@@ -75,7 +75,11 @@ final class LiteRTModelStore: ModelInstaller {
         }
 
         let initialProgress = await initialDownloadProgress(for: model)
-        installStates[modelID] = .downloading(completedFiles: 0, totalFiles: 1, currentFile: model.fileName)
+        installStates[modelID] = .downloading(
+            completedFiles: 0,
+            totalFiles: 1 + model.companionFiles.count,
+            currentFile: model.fileName
+        )
         downloadProgress[modelID] = initialProgress
 
         let task = Task { [weak self] in
@@ -146,6 +150,7 @@ final class LiteRTModelStore: ModelInstaller {
             throw LiteRTDownloadError.invalidResponse
         }
         try await validateDownloadedFile(model: model, at: path)
+        try await validateRequiredCompanions(for: model, baseDirectory: path.deletingLastPathComponent())
 
         // 下载完成后处理: 解压归档型 companion (例如 ANE .mlmodelc.zip).
         // 失败处理:
@@ -309,7 +314,7 @@ final class LiteRTModelStore: ModelInstaller {
     }
 
     private func initialDownloadProgress(for model: ModelDescriptor) async -> DownloadProgress {
-        let fallbackTotal = model.expectedFileSize > 0 ? model.expectedFileSize : nil
+        let fallbackTotal = model.totalDownloadSize > 0 ? model.totalDownloadSize : nil
         guard let state = try? await downloadManifestStore().resumeState(for: model.id),
               state.downloadedBytes > 0 else {
             return DownloadProgress(totalBytes: fallbackTotal, currentFile: model.fileName)
@@ -439,10 +444,32 @@ final class LiteRTModelStore: ModelInstaller {
     }
 
     func remove(model: ModelDescriptor) throws {
-        guard let path = artifactPath(for: model) else { return }
-        try FileManager.default.removeItem(at: path)
+        activeTasks[model.id]?.cancel()
+        activeTasks[model.id] = nil
+        let fileManager = FileManager.default
+        let candidateDirectories = Set(
+            primaryArtifactCandidates(for: model)
+                .filter(isUserModelPath)
+                .map { $0.deletingLastPathComponent() }
+        )
+
+        for artifact in primaryArtifactCandidates(for: model)
+            where isUserModelPath(artifact) && fileManager.fileExists(atPath: artifact.path) {
+            try fileManager.removeItem(at: artifact)
+        }
+
+        for directory in candidateDirectories {
+            for companion in model.companionFiles {
+                for url in companionStorageCandidates(for: companion, baseDirectory: directory) where fileManager.fileExists(atPath: url.path) {
+                    try? fileManager.removeItem(at: url)
+                }
+            }
+        }
+
         Task { try? await downloadCoordinator().purge(assetID: model.id) }
         installStates[model.id] = .notInstalled
+        resumableModelIDs.remove(model.id)
+        downloadProgress[model.id] = nil
     }
 
     func cancelInstall(modelID: String) {
@@ -464,42 +491,153 @@ final class LiteRTModelStore: ModelInstaller {
         resumableModelIDs.contains(modelID)
     }
 
+    func hasLocalArtifacts(for model: ModelDescriptor) -> Bool {
+        if resumableModelIDs.contains(model.id) || downloadProgress[model.id] != nil {
+            return true
+        }
+
+        let fileManager = FileManager.default
+        let userArtifactCandidates = primaryArtifactCandidates(for: model).filter(isUserModelPath)
+        if userArtifactCandidates.contains(where: { fileManager.fileExists(atPath: $0.path) }) {
+            return true
+        }
+
+        let candidateDirectories = Set(userArtifactCandidates.map { $0.deletingLastPathComponent() })
+        for directory in candidateDirectories {
+            for companion in model.companionFiles {
+                if companionStorageCandidates(for: companion, baseDirectory: directory)
+                    .contains(where: { fileManager.fileExists(atPath: $0.path) }) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
     func artifactPath(for model: ModelDescriptor) -> URL? {
+        for candidate in primaryArtifactCandidates(for: model) {
+            guard completeFileExists(at: candidate, expectedSize: model.expectedFileSize) else {
+                continue
+            }
+
+            let baseDirectory = candidate.deletingLastPathComponent()
+            guard requiredCompanionsAvailable(for: model, baseDirectory: baseDirectory) else {
+                continue
+            }
+
+            return candidate
+        }
+
+        return nil
+    }
+
+    private func primaryArtifactCandidates(for model: ModelDescriptor) -> [URL] {
+        var candidates: [URL] = []
+
         // 1. 优先检查 app bundle（打包进去的模型）
         let baseName = (model.fileName as NSString).deletingPathExtension
         let ext = (model.fileName as NSString).pathExtension
         if let bundlePath = Bundle.main.url(forResource: baseName, withExtension: ext) {
-            return bundlePath
+            candidates.append(bundlePath)
         }
         // 2. fallback 到 Documents/models/（下载的模型）
-        let path = modelsDirectory.appendingPathComponent(model.fileName)
-        return FileManager.default.fileExists(atPath: path.path) ? path : nil
+        candidates.append(modelsDirectory.appendingPathComponent(model.fileName))
+        return candidates
+    }
+
+    private func completeFileExists(at url: URL, expectedSize: Int64) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            return false
+        }
+        if isDirectory.boolValue {
+            return true
+        }
+
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? Int64 else {
+            return false
+        }
+        guard expectedSize > 0 else {
+            return true
+        }
+        return size >= expectedSize * 9 / 10
+    }
+
+    private func requiredCompanionsAvailable(for model: ModelDescriptor, baseDirectory: URL) -> Bool {
+        model.companionFiles
+            .filter(\.isRequired)
+            .allSatisfy { companion in
+                companionStorageCandidates(for: companion, baseDirectory: baseDirectory)
+                    .contains { completeFileExists(at: $0, expectedSize: companion.expectedFileSize) }
+            }
+    }
+
+    private func companionStorageCandidates(for companion: CompanionFile, baseDirectory: URL) -> [URL] {
+        var candidates: [URL] = []
+
+        candidates.append(baseDirectory.appendingPathComponent(companion.localResourceName))
+        if companion.fileName != companion.localResourceName {
+            candidates.append(baseDirectory.appendingPathComponent(companion.fileName))
+        }
+        if companion.role == .multimodalProjector {
+            candidates.append(baseDirectory.appendingPathComponent("MiniCPM-V-4_6-mmproj-f16.gguf"))
+        }
+
+        return Array(Set(candidates))
+    }
+
+    private func validateRequiredCompanions(for model: ModelDescriptor, baseDirectory: URL) async throws {
+        for companion in model.companionFiles where companion.isRequired {
+            let available = companionStorageCandidates(for: companion, baseDirectory: baseDirectory)
+                .contains { completeFileExists(at: $0, expectedSize: companion.expectedFileSize) }
+            guard available else {
+                try? await downloadCoordinator().purge(assetID: model.id)
+                throw LiteRTDownloadError.invalidResponse
+            }
+        }
     }
 
     func refreshInstallStates() {
         for model in ModelDescriptor.allModels {
+            if activeTasks[model.id] != nil {
+                continue
+            }
+
             if let path = artifactPath(for: model) {
-                // 校验文件大小 — 不完整的文件自动清理
-                if model.expectedFileSize > 0,
-                   let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
-                   let size = attrs[.size] as? Int64,
-                   size < model.expectedFileSize * 9 / 10 {
-                    let expectedMB = model.expectedFileSize / 1_000_000
-                    let actualMB = size / 1_000_000
-                    PCLog.debug("[ModelStore] ⚠️ \(model.fileName) 文件不完整 (\(actualMB)MB/\(expectedMB)MB)，已自动清理")
-                    try? FileManager.default.removeItem(at: path)
-                    Task { try? await downloadCoordinator().purge(assetID: model.id) }
-                    installStates[model.id] = .notInstalled
-                } else {
-                    installStates[model.id] = .downloaded
-                    resumableModelIDs.remove(model.id)
-                    downloadProgress[model.id] = nil
-                }
+                installStates[model.id] = path.path.hasPrefix(Bundle.main.bundlePath) ? .bundled : .downloaded
+                resumableModelIDs.remove(model.id)
+                downloadProgress[model.id] = nil
             } else {
+                purgeIncompletePrimaryArtifactIfNeeded(for: model)
                 installStates[model.id] = .notInstalled
             }
         }
         refreshResumableStates()
+    }
+
+    private func purgeIncompletePrimaryArtifactIfNeeded(for model: ModelDescriptor) {
+        guard model.expectedFileSize > 0 else { return }
+
+        for artifact in primaryArtifactCandidates(for: model)
+            where isUserModelPath(artifact) && FileManager.default.fileExists(atPath: artifact.path) {
+            guard !completeFileExists(at: artifact, expectedSize: model.expectedFileSize),
+                  let attrs = try? FileManager.default.attributesOfItem(atPath: artifact.path),
+                  let size = attrs[.size] as? Int64 else {
+                continue
+            }
+
+            let expectedMB = model.expectedFileSize / 1_000_000
+            let actualMB = size / 1_000_000
+            PCLog.debug("[ModelStore] ⚠️ \(model.fileName) 文件不完整 (\(actualMB)MB/\(expectedMB)MB)，已自动清理")
+            try? FileManager.default.removeItem(at: artifact)
+            Task { try? await downloadCoordinator().purge(assetID: model.id) }
+        }
+    }
+
+    private func isUserModelPath(_ url: URL) -> Bool {
+        url.standardizedFileURL.path.hasPrefix(modelsDirectory.standardizedFileURL.path)
     }
 
     private func refreshResumableStates() {
